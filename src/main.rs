@@ -1,4 +1,5 @@
 use eframe::egui;
+use chrono::{DateTime, TimeZone, Utc, Local, FixedOffset};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -38,12 +39,14 @@ impl Default for NtpServerInfo {
 #[derive(Clone)]
 struct Settings {
     update_frequency_seconds: u64,
+    timezone: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             update_frequency_seconds: 10,
+            timezone: "UTC".to_string(),
         }
     }
 }
@@ -206,7 +209,7 @@ impl NtpMonitorApp {
                             
                             // Current time
                             if let Some(time) = server.current_time {
-                                let datetime = format_system_time(time);
+                                let datetime = format_system_time_with_timezone(time, &self.settings.timezone);
                                 ui.label(datetime);
                             } else {
                                 ui.label("N/A");
@@ -273,6 +276,23 @@ impl NtpMonitorApp {
                 ui.add_space(20.0);
                 ui.label(format!("Current: Every {} seconds", self.temp_settings.update_frequency_seconds));
                 
+                ui.add_space(30.0);
+                
+                ui.horizontal(|ui| {
+                    ui.label("Timezone:");
+                    egui::ComboBox::from_label("")
+                        .selected_text(&self.temp_settings.timezone)
+                        .show_ui(ui, |ui| {
+                            let timezones = get_common_timezones();
+                            for tz in timezones {
+                                ui.selectable_value(&mut self.temp_settings.timezone, tz.clone(), tz);
+                            }
+                        });
+                });
+                
+                ui.add_space(20.0);
+                ui.label(format!("Selected: {}", self.temp_settings.timezone));
+                
                 ui.add_space(40.0);
                 
                 ui.horizontal(|ui| {
@@ -292,10 +312,10 @@ impl NtpMonitorApp {
     }
 
     fn show_countdown(&self, ui: &mut egui::Ui) {
-        // Show current time
+        // Show current time in selected timezone
         let now = SystemTime::now();
-        let current_time = format_system_time_full(now);
-        ui.label(format!("Current time: {}", current_time));
+        let current_time = format_system_time_with_timezone(now, &self.settings.timezone);
+        ui.label(format!("Current time ({}): {}", self.settings.timezone, current_time));
         
         ui.add_space(10.0);
         
@@ -472,10 +492,13 @@ impl NtpMonitorApp {
                             ip: resolve_hostname(value).unwrap_or_else(|| value.to_string()),
                             ..Default::default()
                         });
-                    } else if current_section == "settings" && key == "update_frequency_seconds" {
-                        if let Ok(freq_val) = value.parse::<u64>() {
-                            self.settings.update_frequency_seconds = freq_val.clamp(5, 300);
-                            self.temp_settings = self.settings.clone();
+                    } else if current_section == "settings" {
+                        if key == "update_frequency_seconds" {
+                            if let Ok(freq_val) = value.parse::<u64>() {
+                                self.settings.update_frequency_seconds = freq_val.clamp(5, 300);
+                            }
+                        } else if key == "timezone" {
+                            self.settings.timezone = value.to_string();
                         }
                     }
                 }
@@ -484,6 +507,9 @@ impl NtpMonitorApp {
             if !servers.is_empty() {
                 *self.servers.lock().unwrap() = servers;
             }
+            
+            // Update temp_settings after loading
+            self.temp_settings = self.settings.clone();
         }
     }
 
@@ -504,6 +530,7 @@ impl NtpMonitorApp {
         // Save settings
         content.push_str("\n[settings]\n");
         content.push_str(&format!("update_frequency_seconds = {}\n", self.settings.update_frequency_seconds));
+        content.push_str(&format!("timezone = {}\n", self.settings.timezone));
         
         if let Err(e) = std::fs::write(CONFIG_FILE, content) {
             eprintln!("Failed to save servers to {}: {}", CONFIG_FILE, e);
@@ -576,30 +603,72 @@ fn format_system_time(time: SystemTime) -> String {
     }
 }
 
-fn format_system_time_full(time: SystemTime) -> String {
+fn format_system_time_with_timezone(time: SystemTime, timezone: &str) -> String {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
-            let total_secs = duration.as_secs();
-            let days = total_secs / 86400;
-            let secs = total_secs % 86400;
-            let hours = secs / 3600;
-            let minutes = (secs % 3600) / 60;
-            let seconds = secs % 60;
+            let timestamp = duration.as_secs() as i64;
+            let datetime = DateTime::<Utc>::from_timestamp(timestamp, 0);
             
-            // Calculate rough date (this is a simple approximation)
-            let days_since_epoch = days;
-            let years_since_1970 = days_since_epoch / 365;
-            let year = 1970 + years_since_1970;
-            let remaining_days = days_since_epoch % 365;
-            let month = (remaining_days / 30) + 1;
-            let day = (remaining_days % 30) + 1;
-            
-            format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", 
-                    year.min(2100), month.min(12).max(1), day.min(31).max(1),
-                    hours, minutes, seconds)
+            if let Some(dt) = datetime {
+                match timezone {
+                    "UTC" => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                    "Local" => {
+                        let local_dt = dt.with_timezone(&Local);
+                        local_dt.format("%Y-%m-%d %H:%M:%S %Z").to_string()
+                    },
+                    "EST" => {
+                        let est = FixedOffset::west_opt(5 * 3600).unwrap();
+                        let est_dt = dt.with_timezone(&est);
+                        est_dt.format("%Y-%m-%d %H:%M:%S EST").to_string()
+                    },
+                    "PST" => {
+                        let pst = FixedOffset::west_opt(8 * 3600).unwrap();
+                        let pst_dt = dt.with_timezone(&pst);
+                        pst_dt.format("%Y-%m-%d %H:%M:%S PST").to_string()
+                    },
+                    "MST" => {
+                        let mst = FixedOffset::west_opt(7 * 3600).unwrap();
+                        let mst_dt = dt.with_timezone(&mst);
+                        mst_dt.format("%Y-%m-%d %H:%M:%S MST").to_string()
+                    },
+                    "CST" => {
+                        let cst = FixedOffset::west_opt(6 * 3600).unwrap();
+                        let cst_dt = dt.with_timezone(&cst);
+                        cst_dt.format("%Y-%m-%d %H:%M:%S CST").to_string()
+                    },
+                    "GMT" => dt.format("%Y-%m-%d %H:%M:%S GMT").to_string(),
+                    "CET" => {
+                        let cet = FixedOffset::east_opt(1 * 3600).unwrap();
+                        let cet_dt = dt.with_timezone(&cet);
+                        cet_dt.format("%Y-%m-%d %H:%M:%S CET").to_string()
+                    },
+                    "JST" => {
+                        let jst = FixedOffset::east_opt(9 * 3600).unwrap();
+                        let jst_dt = dt.with_timezone(&jst);
+                        jst_dt.format("%Y-%m-%d %H:%M:%S JST").to_string()
+                    },
+                    _ => dt.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+                }
+            } else {
+                "Invalid".to_string()
+            }
         }
         Err(_) => "Invalid".to_string(),
     }
+}
+
+fn get_common_timezones() -> Vec<String> {
+    vec![
+        "UTC".to_string(),
+        "Local".to_string(),
+        "GMT".to_string(),
+        "EST".to_string(),
+        "CST".to_string(),
+        "MST".to_string(),
+        "PST".to_string(),
+        "CET".to_string(),
+        "JST".to_string(),
+    ]
 }
 
 fn main() -> Result<(), eframe::Error> {
